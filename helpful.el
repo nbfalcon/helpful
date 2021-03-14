@@ -1186,7 +1186,12 @@ buffer."
   (helpful--ensure)
   (unless helpful--callable-p
     (user-error "Cannot trace a variable"))
-  (helpful--toggle-tracing helpful--sym)
+  (helpful--toggle-tracing helpful--sym))
+
+(defun helpful--remove-advice (button)
+  "Remove advice for BUTTON."
+  (advice-remove (button-get button 'symbol)
+                 (button-get button 'advice))
   (helpful-update))
 
 (defun helpful-callees ()
@@ -1202,6 +1207,15 @@ buffer."
   (helpful--ensure)
   (helpful--all-references-1 helpful--sym helpful--callable-p))
 
+(define-button-type 'helpful-remove-advice-button
+  'action #'helpful--remove-advice
+  'help-echo "Remove advice")
+
+(defun helpful--remove-all-advice-1 (sym)
+  "Remove all advice from SYM."
+  (advice-mapc (lambda (advice x) (advice-remove sym advice)) sym)
+  (helpful-update))
+
 (defun helpful-set-value ()
   (interactive)
   (helpful--ensure)
@@ -1209,12 +1223,30 @@ buffer."
     (user-error "Cannot set function"))
   (helpful--set-1 helpful--sym helpful--associated-buffer))
 
+(defun helpful--remove-all-advice (button)
+  "Remove all advice for BUTTON."
+  (helpful--remove-all-advice-1 (button-get button 'symbol)))
+
+(define-button-type 'helpful-remove-all-advice-button
+  'action #'helpful--remove-all-advice
+  'help-echo "Remove all advice")
+
 (defun helpful-customize ()
-  (interactive)
   (helpful--ensure)
   (when helpful--callable-p
     (user-error "Cannot customize functions"))
   (customize-variable helpful--sym))
+
+(defun helpful-remove-all-advice ()
+  "Remove all advice for the current helpful symbol."
+  (interactive)
+  (unless (derived-mode-p #'helpful-mode)
+    (user-error "Must be in a *helpful* buffer"))
+  (unless helpful--callable-p
+    (user-error "Cannot unadvise a variable"))
+  (unless (helpful--advised-p helpful--sym)
+    (user-error "Function not advised"))
+  (helpful--remove-all-advice-1 helpful--sym))
 
 (defun helpful--propertize-links (docstring)
   "Convert URL links in docstrings to buttons."
@@ -2261,7 +2293,8 @@ state of the current symbol."
           (references (helpful--calculate-references
                        helpful--sym helpful--callable-p
                        source-path))
-          (aliases (helpful--aliases helpful--sym helpful--callable-p)))
+          (aliases (helpful--aliases helpful--sym helpful--callable-p))
+          (advised? (helpful--advised-p helpful--sym)))
 
     (erase-buffer)
 
@@ -2359,6 +2392,26 @@ state of the current symbol."
           (insert "\n\n")
           (insert (helpful--make-manual-button helpful--sym)))))
 
+    (when advised?
+      (helpful--insert-section-break)
+      (insert (helpful--heading "Advice"))
+      (dolist (x (helpful--get-advice helpful--sym))
+        (cl-destructuring-bind (combinator . advice) x
+          (insert (helpful--button "X" 'helpful-remove-advice-button
+                                   'symbol helpful--sym
+                                   'advice advice)
+                  " "
+                  (propertize (symbol-name combinator) 'face 'font-lock-builtin-face)
+                  " "
+                  (helpful--button
+                   (symbol-name advice) 'helpful-describe-button
+                   'symbol advice
+                   'callable-p t)
+                  "\n")))
+      ;; We've inserted one newline too many, since the next section will insert
+      ;; a section break.
+      (delete-char -1))
+
     ;; Show keybindings.
     ;; TODO: allow users to conveniently add and remove keybindings.
     (when (commandp helpful--sym)
@@ -2403,13 +2456,6 @@ state of the current symbol."
        " "
        (helpful--make-callees-button helpful--sym source)))
 
-    (when (helpful--advised-p helpful--sym)
-      (helpful--insert-section-break)
-      (insert
-       (helpful--heading "Advice")
-       (format "This %s is advised."
-               (if (macrop helpful--sym) "macro" "function"))))
-
     (let ((can-edebug
            (helpful--can-edebug-p helpful--sym helpful--callable-p buf pos))
           (can-trace
@@ -2438,7 +2484,7 @@ state of the current symbol."
 
       (when (and
              (or can-edebug can-trace)
-             (or can-disassemble can-forget))
+             (or can-disassemble can-forget advised?))
         (insert "\n"))
 
       (when can-disassemble
@@ -2447,7 +2493,12 @@ state of the current symbol."
       (when can-forget
         (when can-disassemble
           (insert " "))
-        (insert (helpful--make-forget-button helpful--sym helpful--callable-p))))
+        (insert (helpful--make-forget-button helpful--sym helpful--callable-p)))
+      (when advised?
+        (when (or can-forget can-disassemble)
+          (insert " "))
+        (insert (helpful--button "Remove all advice" 'helpful-remove-all-advice-button
+                                 'symbol helpful--sym))))
 
     (when aliases
       (helpful--insert-section-break)
@@ -2523,16 +2574,41 @@ state of the current symbol."
     (when opened
       (kill-buffer buf))))
 
+(defconst helpful--advice-regexp
+  "^\\(?:This function has \\)?\\(:[-a-z]+\\) advice: `\\(.*\\)'\\.?$"
+  "Regexp matching advice lines.
+Match group 1 is the combinator, with colon, and match group 2 is
+the advice.")
+
 ;; TODO: this isn't sufficient for `edebug-eval-defun'.
 (defun helpful--skip-advice (docstring)
   "Remove mentions of advice from DOCSTRING."
-  (let* ((lines (s-lines docstring))
-         (relevant-lines
-          (--drop-while
-           (or (s-starts-with-p ":around advice:" it)
-               (s-starts-with-p "This function has :around advice:" it))
-           lines)))
-    (s-trim (s-join "\n" relevant-lines))))
+  (with-temp-buffer
+    (insert docstring)
+    (goto-char (point-min))
+    (save-match-data
+      (while (looking-at helpful--advice-regexp)
+        (delete-region (match-beginning 0) (1+ (match-end 0)))))
+    (when (eq (char-after) ?\n)
+      (delete-char 1))
+    (buffer-substring-no-properties (point-min) (point-max))))
+
+(defun helpful--extract-advice (docstring)
+  "Extract `advice' from DOCSTRING."
+  (let ((lines (s-lines docstring))
+        line result)
+    (save-match-data
+      (while (and lines (string-match helpful--advice-regexp
+                                      (setq line (pop lines))))
+        (push (cons (intern (match-string-no-properties 1 line))
+                    (intern (match-string-no-properties 2 line)))
+              result))
+      result)))
+
+(defun helpful--get-advice (sym)
+  "Extract `advice' from SYM."
+  (helpful--extract-advice (let ((text-quoting-style 'grave))
+                             (documentation sym t))))
 
 (defun helpful--format-argument (arg)
   "Format ARG (a symbol) according to Emacs help conventions."
@@ -2631,10 +2707,7 @@ escapes that are used by `substitute-command-keys'."
           (setq docstring (documentation sym t))
           (-when-let (docstring-with-usage (help-split-fundoc docstring sym))
             (setq docstring (cdr docstring-with-usage))
-            (when docstring
-              ;; Advice mutates the docstring, see
-              ;; `advice--make-docstring'. Undo that.
-              ;; TODO: Only do this if the function is advised.
+            (when (helpful--advised-p sym)
               (setq docstring (helpful--skip-advice docstring)))))
       (setq docstring
             (documentation-property sym 'variable-documentation t)))
